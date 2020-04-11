@@ -1,14 +1,16 @@
 package main
 
 import (
-	"context"
 	"crypto/md5"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"regexp"
 
 	"github.com/go-redis/redis"
+	"github.com/gorilla/mux"
 	"github.com/jinzhu/gorm"
 
 	"net/http"
@@ -21,6 +23,12 @@ type urls struct {
 	gorm.Model
 	Tinyurl string `gorm:"unique;not null"`
 	Longurl string
+}
+
+// Response ->  response Object
+type Response struct {
+	Code int
+	Msg  string
 }
 
 // PostgresClient -> Provides a connection to the postgres database server
@@ -86,11 +94,14 @@ func IndexHandler(res http.ResponseWriter, req *http.Request) {
 func GetTinyHandler(res http.ResponseWriter, req *http.Request, dbClient *gorm.DB, redisClient *redis.Client) {
 	requestParams, err := req.URL.Query()["longUrl"]
 	if !err || len(requestParams[0]) < 1 {
-		io.WriteString(res, "URL parameter longUrl is missing")
+		res.WriteHeader(400)
+		json.NewEncoder(res).Encode(Response{400, "missing tinyURL parameter"})
 	} else {
 		longURL := requestParams[0]
 		tinyURL := GenerateHashAndInsert(longURL, 0, dbClient, redisClient)
-		io.WriteString(res, tinyURL)
+
+		res.WriteHeader(http.StatusCreated)
+		json.NewEncoder(res).Encode(Response{201, tinyURL})
 	}
 }
 
@@ -98,60 +109,59 @@ func GetTinyHandler(res http.ResponseWriter, req *http.Request, dbClient *gorm.D
 func GetLongHandler(res http.ResponseWriter, req *http.Request, dbClient *gorm.DB, redisClient *redis.Client) {
 	requestParams, err := req.URL.Query()["tinyUrl"]
 	if !err || len(requestParams[0]) < 1 {
-		io.WriteString(res, "URL parameter tinyUrl is missing")
-	}
-	tinyURL := requestParams[0]
-	redisSearchResult := redisClient.HGet("urls", tinyURL)
-	if redisSearchResult.Val() != "" {
-		io.WriteString(res, redisSearchResult.Val())
+		res.WriteHeader(400)
+		json.NewEncoder(res).Encode(Response{400, "missing longURL parameter"})
 	} else {
-		var url urls
-		dbClient.Where("tinyurl = ?", tinyURL).Select("longurl").Find(&url)
-		if url.Longurl != "" {
-			redisClient.HSet("urls", tinyURL, url.Longurl)
-			io.WriteString(res, url.Longurl)
+		tinyURL := requestParams[0]
+		redisSearchResult := redisClient.HGet("urls", tinyURL)
+		if redisSearchResult.Val() != "" {
+			json.NewEncoder(res).Encode(Response{200, redisSearchResult.Val()})
 		} else {
-			io.WriteString(res, "Unable to find long URL")
+			var url urls
+			dbClient.Where("tinyurl = ?", tinyURL).Select("longurl").Find(&url)
+			if url.Longurl != "" {
+				redisClient.HSet("urls", tinyURL, url.Longurl)
+
+				res.WriteHeader(http.StatusCreated)
+				json.NewEncoder(res).Encode(Response{201, url.Longurl})
+			} else {
+				res.WriteHeader(404)
+				json.NewEncoder(res).Encode(Response{400, "invalid parameter"})
+			}
 		}
 	}
 }
 
-// StopHandler -> Stops the server on request to /stop route
-func StopHandler(res http.ResponseWriter, req *http.Request, dbClient *gorm.DB, redisClient *redis.Client, serverInstance *http.Server) {
-	fmt.Println("Stopping server...\n")
-	dbClient.Close()
-	redisClient.Close()
-	serverInstance.Shutdown(context.TODO())
-}
-
 func main() {
+	// redis client
 	redisClient := RedisClient()
 
+	// ping redis DB
 	pong, err := redisClient.Ping().Result()
 	fmt.Println("Redis ping", pong, err)
 
+	// Postgres client
 	dbClient := PostgresClient()
 	defer dbClient.Close()
 
+	// Automatically migrate the schema, to keep the schema update to date.
 	dbClient.AutoMigrate(&urls{})
 
-	serverInstance := &http.Server{
-		Addr: ":8080",
-	}
+	// mux router instance
+	router := mux.NewRouter()
 
-	http.HandleFunc("/long/", func(w http.ResponseWriter, r *http.Request) {
-		GetLongHandler(w, r, dbClient, redisClient)
-	})
+	// home endpoint
+	router.HandleFunc("/", IndexHandler)
 
-	http.HandleFunc("/tiny/", func(w http.ResponseWriter, r *http.Request) {
+	// 'tiny/' is get method endpoint returns tiny url
+	router.HandleFunc("/tiny/", func(w http.ResponseWriter, r *http.Request) {
 		GetTinyHandler(w, r, dbClient, redisClient)
-	})
+	}).Methods("GET")
 
-	http.HandleFunc("/stop", func(w http.ResponseWriter, r *http.Request) {
-		StopHandler(w, r, dbClient, redisClient, serverInstance)
-	})
+	// 'long/' is get method endpoint returns long url
+	router.HandleFunc("/long/", func(w http.ResponseWriter, r *http.Request) {
+		GetLongHandler(w, r, dbClient, redisClient)
+	}).Methods("GET")
 
-	http.HandleFunc("/", IndexHandler)
-
-	serverInstance.ListenAndServe()
+	log.Fatal(http.ListenAndServe(":8080", router))
 }
